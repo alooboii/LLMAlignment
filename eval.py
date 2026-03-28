@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -103,6 +105,7 @@ def main() -> None:
     )
 
     print("=== RM Win-Rate vs SFT ===")
+    resource_rows: list[tuple[str, float | None, float | None, float | None]] = []
     for cand in candidates:
         model, _ = load_policy_or_adapter(
             cand.path,
@@ -146,6 +149,20 @@ def main() -> None:
         token_mask = build_next_token_mask(generated["response_mask"])
         kl_mc = masked_mean(lp_model - lp_ref, token_mask).item()
         print(f"{cand.name:12s} win_rate={win_rate:.3f} rm_mean={scores.mean().item():.3f} kl={kl_mc:.4f}")
+        metrics_path = Path(cand.path) / "metrics.json"
+        if metrics_path.exists():
+            with metrics_path.open("r", encoding="utf-8") as f:
+                m = json.load(f)
+            resource_rows.append(
+                (
+                    cand.name,
+                    float(m.get("peak_vram_gb")) if m.get("peak_vram_gb") is not None else None,
+                    float(m.get("avg_step_sec")) if m.get("avg_step_sec") is not None else None,
+                    float(m.get("total_train_sec")) if m.get("total_train_sec") is not None else None,
+                )
+            )
+        else:
+            resource_rows.append((cand.name, None, None, None))
 
         print(f"\n--- Sample Table: {cand.name} ---")
         for i in range(min(args.sample_size, len(prompts))):
@@ -157,6 +174,14 @@ def main() -> None:
                 f"RM(SFT)={sft_scores[i].item():.3f} RM({cand.name})={scores[i].item():.3f}"
             )
             print()
+
+    print("=== Resource Table ===")
+    print("method        peak_vram_gb   sec_per_step   total_sec")
+    for name, peak_vram, sec_per_step, total_sec in resource_rows:
+        peak_s = f"{peak_vram:.2f}" if peak_vram is not None else "n/a"
+        step_s = f"{sec_per_step:.3f}" if sec_per_step is not None else "n/a"
+        total_s = f"{total_sec:.1f}" if total_sec is not None else "n/a"
+        print(f"{name:12s} {peak_s:>12s} {step_s:>13s} {total_s:>10s}")
 
     if args.eval_gsm8k:
         gsm_test = list(load_gsm8k("test"))
@@ -193,4 +218,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

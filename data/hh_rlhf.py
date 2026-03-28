@@ -91,11 +91,24 @@ def load_hh_harmless(
     if load_dataset is None:
         raise ImportError("datasets is required. Install with `pip install datasets`.")
 
+    # Primary attempt: load harmless config directly.
     try:
         return load_dataset(dataset_name, harmless_config, split=split)
     except Exception:
-        # Fallback for environments that expose harmless as part of default config.
-        return load_dataset(dataset_name, split=split)
+        pass
+
+    # Fallback 1: some loaders expose subset via data_dir.
+    try:
+        return load_dataset(dataset_name, data_dir=harmless_config, split=split)
+    except Exception:
+        pass
+
+    # Fallback 2 (strict harmless): load harmless files explicitly.
+    # This avoids silently loading all HH subsets (~160k) when config routing changes.
+    if split not in {"train", "test"}:
+        raise ValueError(f"Unsupported split for harmless subset: {split}")
+    url = f"https://huggingface.co/datasets/{dataset_name}/resolve/main/harmless-base/{split}.jsonl.gz"
+    return load_dataset("json", data_files={split: url}, split=split)
 
 
 def build_hh_datasets(

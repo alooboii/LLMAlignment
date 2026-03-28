@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import random
 import time
 from pathlib import Path
@@ -29,7 +30,7 @@ from alignment.ppo import (
     ratio_sanity_test,
     standardize_advantages,
 )
-from data.gsm8k import extract_gold_answer, format_gsm8k_prompt, load_gsm8k, verifiable_reward
+from data.gsm8k import extract_gold_answer, extract_numeric_answer, format_gsm8k_prompt, load_gsm8k, verifiable_reward
 from data.hh_rlhf import DPOCollator, PreferenceTriple, build_dataloader, build_hh_datasets
 from model.loading import (
     count_parameters,
@@ -80,7 +81,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-dropout", type=float, default=0.05)
 
     parser.add_argument("--train-limit", type=int, default=None)
-    parser.add_argument("--test-limit", type=int, default=2000)
+    parser.add_argument("--test-limit", type=int, default=None)
     parser.add_argument("--eval-size", type=int, default=200)
     parser.add_argument("--eval-every", type=int, default=25)
 
@@ -89,6 +90,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--value-model-name", type=str, default="meta-llama/Llama-3.2-1B-Instruct")
     parser.add_argument("--rlvr-max-new-tokens", type=int, default=256)
     return parser.parse_args()
+
+
+def start_resource_tracking() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+
+def collect_resource_metrics(step_durations: list[float], total_seconds: float) -> dict[str, float]:
+    peak_vram_gb = 0.0
+    if torch.cuda.is_available():
+        peak_vram_gb = torch.cuda.max_memory_allocated() / (1024**3)
+    avg_step_sec = sum(step_durations) / max(len(step_durations), 1)
+    return {
+        "peak_vram_gb": peak_vram_gb,
+        "avg_step_sec": avg_step_sec,
+        "total_train_sec": total_seconds,
+        "num_update_steps": float(len(step_durations)),
+    }
+
+
+def save_run_metrics(out_dir: Path, metrics: dict[str, Any]) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with (out_dir / "metrics.json").open("w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2, sort_keys=True)
 
 
 def sample_prompts(
@@ -278,7 +303,7 @@ def evaluate_gsm8k_pass1(
         do_sample=False,
     )
     rewards = [verifiable_reward(pred, g) for pred, g in zip(generated["responses"], gold, strict=True)]
-    compliance = [1.0 if r is not None else 0.0 for r in (extract_gold_answer(text) for text in generated["responses"])]
+    compliance = [1.0 if extract_numeric_answer(text) is not None else 0.0 for text in generated["responses"]]
     return {
         "pass_at_1": float(sum(rewards) / max(len(rewards), 1)),
         "format_compliance": float(sum(compliance) / max(len(compliance), 1)),
@@ -342,14 +367,28 @@ def run_dpo(args: argparse.Namespace, device: torch.device) -> None:
     train_loader = build_dataloader(train_ds, collator, batch_size=args.batch_size, shuffle=True)
     test_loader = build_dataloader(test_ds, collator, batch_size=args.batch_size, shuffle=False)
 
+    # DPO sanity check: before updates, delta_theta ~= delta_ref so implicit margin near 0.
+    sanity_batch = next(iter(test_loader))
+    sanity_batch = move_batch_to_device(sanity_batch, device)
+    with torch.no_grad():
+        sanity_out = dpo_forward_pass(policy, reference, batch=sanity_batch, beta=args.beta)
+    print(
+        f"DPO init sanity: implicit_margin={sanity_out.implicit_margin.item():.4f} "
+        f"pref_acc={sanity_out.preference_accuracy.item():.3f} (expected around 0.5)"
+    )
+
     optimizer = AdamW((p for p in policy.parameters() if p.requires_grad), lr=args.lr_policy, weight_decay=args.weight_decay)
     policy.train()
     step = 0
+    step_durations: list[float] = []
+    start_resource_tracking()
+    total_start = time.perf_counter()
     optimizer.zero_grad(set_to_none=True)
 
     for epoch in range(args.epochs):
         pbar = tqdm(train_loader, desc=f"DPO epoch {epoch + 1}/{args.epochs}")
         for i, batch in enumerate(pbar, start=1):
+            iter_start = time.perf_counter()
             batch = move_batch_to_device(batch, device)
             out = dpo_forward_pass(policy, reference, batch=batch, beta=args.beta)
             (out.loss / args.grad_accum).backward()
@@ -358,6 +397,7 @@ def run_dpo(args: argparse.Namespace, device: torch.device) -> None:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 step += 1
+                step_durations.append(time.perf_counter() - iter_start)
 
                 if step % args.eval_every == 0:
                     pref = []
@@ -396,6 +436,9 @@ def run_dpo(args: argparse.Namespace, device: torch.device) -> None:
     save_path.mkdir(parents=True, exist_ok=True)
     policy.save_pretrained(save_path)
     tokenizer.save_pretrained(save_path)
+    run_metrics = collect_resource_metrics(step_durations, total_seconds=time.perf_counter() - total_start)
+    run_metrics["method"] = "dpo"
+    save_run_metrics(save_path, run_metrics)
     print(f"Saved DPO policy to {save_path}")
 
 
@@ -432,6 +475,9 @@ def run_ppo(args: argparse.Namespace, device: torch.device) -> None:
 
     pol_opt = AdamW((p for p in policy.parameters() if p.requires_grad), lr=args.lr_policy, weight_decay=args.weight_decay)
     val_opt = AdamW((p for p in value_model.parameters() if p.requires_grad), lr=args.lr_value, weight_decay=args.weight_decay)
+    step_durations: list[float] = []
+    start_resource_tracking()
+    total_start = time.perf_counter()
 
     print("PPO sanity checks:")
     print("  GAE unit test:", gae_unit_test())
@@ -441,6 +487,7 @@ def run_ppo(args: argparse.Namespace, device: torch.device) -> None:
     eval_prompts = [test_ds[i].prompt for i in range(min(args.eval_size, len(test_ds)))]
 
     for step in range(1, args.update_steps + 1):
+        step_start = time.perf_counter()
         prompts = random.sample(prompt_pool, k=min(args.batch_size, len(prompt_pool)))
         rollout = generate_batch(
             policy,
@@ -486,7 +533,9 @@ def run_ppo(args: argparse.Namespace, device: torch.device) -> None:
             gae_lambda=args.gae_lambda,
         )
         advantages = standardize_advantages(advantages, token_mask)
-        print_ratio = ratio_sanity_test(old_log_probs, old_log_probs)
+        with torch.no_grad():
+            start_epoch_log_probs = forward_token_log_probs(policy, input_ids=generated_ids, attention_mask=full_attention)
+        print_ratio = ratio_sanity_test(old_log_probs, start_epoch_log_probs)
 
         for _ in range(args.mini_epochs):
             new_log_probs, token_entropy = compute_token_log_probs_and_entropy(
@@ -541,11 +590,15 @@ def run_ppo(args: argparse.Namespace, device: torch.device) -> None:
                 f"[eval] step={step} win_rate={m['win_rate_vs_sft']:.3f} "
                 f"rm_mean={m['rm_score_mean']:.3f} kl={m['kl_mc']:.4f}"
             )
+        step_durations.append(time.perf_counter() - step_start)
 
     out_dir = Path(args.output_dir) / "ppo"
     out_dir.mkdir(parents=True, exist_ok=True)
     policy.save_pretrained(out_dir)
     tokenizer.save_pretrained(out_dir)
+    run_metrics = collect_resource_metrics(step_durations, total_seconds=time.perf_counter() - total_start)
+    run_metrics["method"] = "ppo"
+    save_run_metrics(out_dir, run_metrics)
     print(f"Saved PPO policy to {out_dir}")
 
 
@@ -578,8 +631,12 @@ def run_grpo_like(args: argparse.Namespace, device: torch.device, *, use_rlvr: b
 
     pol_opt = AdamW((p for p in policy.parameters() if p.requires_grad), lr=args.lr_policy, weight_decay=args.weight_decay)
     mode_name = "rlvr" if use_rlvr else "grpo"
+    step_durations: list[float] = []
+    start_resource_tracking()
+    total_start = time.perf_counter()
 
     for step in range(1, args.update_steps + 1):
+        step_start = time.perf_counter()
         batch_size = min(args.batch_size, len(prompt_pool))
         idx = random.sample(range(len(prompt_pool)), k=batch_size)
         base_prompts = [prompt_pool[i] for i in idx]
@@ -696,11 +753,15 @@ def run_grpo_like(args: argparse.Namespace, device: torch.device, *, use_rlvr: b
                     f"[eval] step={step} win_rate={m['win_rate_vs_sft']:.3f} "
                     f"rm_mean={m['rm_score_mean']:.3f} kl={m['kl_mc']:.4f}"
                 )
+        step_durations.append(time.perf_counter() - step_start)
 
     out_dir = Path(args.output_dir) / mode_name
     out_dir.mkdir(parents=True, exist_ok=True)
     policy.save_pretrained(out_dir)
     tokenizer.save_pretrained(out_dir)
+    run_metrics = collect_resource_metrics(step_durations, total_seconds=time.perf_counter() - total_start)
+    run_metrics["method"] = mode_name
+    save_run_metrics(out_dir, run_metrics)
     print(f"Saved {mode_name.upper()} policy to {out_dir}")
 
 

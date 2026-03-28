@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import torch
@@ -18,7 +19,7 @@ def evaluate_reward_model(
     model: torch.nn.Module,
     loader: torch.utils.data.DataLoader,
     device: torch.device,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], torch.Tensor, torch.Tensor]:
     model.eval()
     total, correct = 0, 0
     chosen_scores_all: list[float] = []
@@ -45,12 +46,31 @@ def evaluate_reward_model(
     pref_acc = correct / max(total, 1)
     chosen_t = torch.tensor(chosen_scores_all, dtype=torch.float32)
     rejected_t = torch.tensor(rejected_scores_all, dtype=torch.float32)
-    return {
+    metrics = {
         "preference_accuracy": pref_acc,
         "chosen_mean": chosen_t.mean().item() if chosen_t.numel() else 0.0,
         "chosen_std": chosen_t.std(unbiased=False).item() if chosen_t.numel() else 0.0,
         "rejected_mean": rejected_t.mean().item() if rejected_t.numel() else 0.0,
         "rejected_std": rejected_t.std(unbiased=False).item() if rejected_t.numel() else 0.0,
+    }
+    return metrics, chosen_t, rejected_t
+
+
+def _histogram_payload(chosen: torch.Tensor, rejected: torch.Tensor, bins: int = 30) -> dict[str, list[float]]:
+    if chosen.numel() == 0 and rejected.numel() == 0:
+        return {"bin_edges": [], "chosen_counts": [], "rejected_counts": []}
+    combined = torch.cat([chosen, rejected]) if chosen.numel() and rejected.numel() else (chosen if chosen.numel() else rejected)
+    min_v = float(combined.min().item())
+    max_v = float(combined.max().item())
+    if min_v == max_v:
+        max_v = min_v + 1e-6
+    bin_edges = torch.linspace(min_v, max_v, bins + 1)
+    chosen_counts = torch.histc(chosen, bins=bins, min=min_v, max=max_v) if chosen.numel() else torch.zeros(bins)
+    rejected_counts = torch.histc(rejected, bins=bins, min=min_v, max=max_v) if rejected.numel() else torch.zeros(bins)
+    return {
+        "bin_edges": bin_edges.tolist(),
+        "chosen_counts": chosen_counts.tolist(),
+        "rejected_counts": rejected_counts.tolist(),
     }
 
 
@@ -144,20 +164,26 @@ def main() -> None:
                 step=global_step,
             )
 
-    metrics = evaluate_reward_model(rm_model, test_loader, device=device)
+    metrics, chosen_scores, rejected_scores = evaluate_reward_model(rm_model, test_loader, device=device)
     print(
         "Test preference_acc={preference_accuracy:.4f} chosen_mean={chosen_mean:.3f} "
         "chosen_std={chosen_std:.3f} rejected_mean={rejected_mean:.3f} "
         "rejected_std={rejected_std:.3f}".format(**metrics)
     )
+    if metrics["preference_accuracy"] < 0.60:
+        print("WARNING: preference accuracy below 0.60 target from assignment guidance.")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     rm_model.save_pretrained(output_dir)
     rm_tokenizer.save_pretrained(output_dir)
+    hist_payload = _histogram_payload(chosen_scores, rejected_scores, bins=30)
+    with (output_dir / "reward_histograms.json").open("w", encoding="utf-8") as f:
+        json.dump(hist_payload, f, indent=2)
+    with (output_dir / "metrics.json").open("w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2, sort_keys=True)
     print(f"Saved reward model to {output_dir}")
 
 
 if __name__ == "__main__":
     main()
-

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .common import masked_mean, masked_std
+from .common import masked_std
 
 
 @dataclass(slots=True)
@@ -74,16 +74,21 @@ def grpo_policy_loss(
     unclipped = ratio * token_advantages
     clipped = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon) * token_advantages
     token_objective = torch.minimum(unclipped, clipped)
-    policy_loss = -masked_mean(token_objective, mask)
-    approx_kl_ref = masked_mean(new_log_probs - ref_log_probs, mask)
+    mask_f = mask.float()
+    seq_len = mask_f.sum(dim=1).clamp(min=1.0)
+    seq_objective = (token_objective * mask_f).sum(dim=1) / seq_len
+    policy_loss = -seq_objective.mean()
+
+    seq_kl = ((new_log_probs - ref_log_probs) * mask_f).sum(dim=1) / seq_len
+    approx_kl_ref = seq_kl.mean()
     total_loss = policy_loss + kl_loss_coef * approx_kl_ref
 
     degenerate = degenerate_group_fraction(group_rewards) if group_rewards is not None else 0.0
+    seq_ratio = (ratio * mask_f).sum(dim=1) / seq_len
     return GRPOLossOutput(
         total_loss=total_loss,
         policy_loss=policy_loss,
         approx_kl_ref=approx_kl_ref.detach(),
-        mean_ratio=masked_mean(ratio, mask).detach(),
+        mean_ratio=seq_ratio.mean().detach(),
         degenerate_fraction=degenerate,
     )
-

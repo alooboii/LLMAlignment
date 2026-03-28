@@ -20,10 +20,12 @@ This repository now includes end-to-end code for the coding tasks in `DVLM_PA2.p
 - `train_sft.py` SFT loop with prompt masking
 - `train_rl.py` PPO/DPO/GRPO/RLVR training loops
 - `eval.py` win-rate, KL, sample table, optional GSM8K pass@1
+- `task_c0.py` C0 setup sanity script (prints parsed triples + memory/params)
 
 ## Quick Start
 
 ```bash
+python task_c0.py
 python train_rm.py --use-lora
 python train_sft.py --use-lora
 python train_rl.py --method ppo --policy-init checkpoints/sft/policy_init --policy-ref checkpoints/sft/policy_ref
