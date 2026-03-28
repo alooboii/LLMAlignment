@@ -1,0 +1,8 @@
+[project]
+name = "llmalignment"
+version = "0.1.0"
+description = "From-scratch RLHF/RLAIF assignment implementation (PPO, DPO, GRPO, RLVR)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+]
