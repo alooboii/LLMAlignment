@@ -94,6 +94,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--load-in-bits", type=int, choices=[4, 8], default=None)
+    parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument("--train-head-only", action="store_true")
     return parser.parse_args()
 
 
@@ -112,6 +114,12 @@ def main() -> None:
         device_map=None,
     )
     rm_model.to(device)
+    if hasattr(rm_model, "config"):
+        rm_model.config.use_cache = False
+    if args.gradient_checkpointing and hasattr(rm_model, "gradient_checkpointing_enable"):
+        rm_model.gradient_checkpointing_enable()
+        if hasattr(rm_model, "enable_input_require_grads"):
+            rm_model.enable_input_require_grads()
     rm_tokenizer.padding_side = "right"
     if rm_tokenizer.pad_token is None:
         rm_tokenizer.pad_token = rm_tokenizer.eos_token
@@ -128,6 +136,10 @@ def main() -> None:
         )
         rm_model = apply_lora(rm_model, lora_cfg)
         rm_model.to(device)
+
+    if args.train_head_only:
+        for name, param in rm_model.named_parameters():
+            param.requires_grad_(name.startswith("score."))
 
     stats = count_parameters(rm_model)
     print(
