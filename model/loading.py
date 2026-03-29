@@ -140,7 +140,27 @@ def load_policy_or_adapter(
     is_trainable_adapter: bool = True,
     enable_gradient_checkpointing: bool = True,
 ):
-    adapter_cfg_path = Path(model_or_adapter_path) / "adapter_config.json"
+    path_obj = Path(model_or_adapter_path).expanduser()
+    local_path_hint = (
+        path_obj.is_absolute()
+        or model_or_adapter_path.startswith(".")
+        or "/" in model_or_adapter_path
+        or "\\" in model_or_adapter_path
+    )
+
+    if path_obj.exists():
+        resolved = path_obj.resolve()
+        model_or_adapter_path = str(resolved)
+        path_obj = resolved
+    elif local_path_hint:
+        cwd = Path.cwd()
+        raise FileNotFoundError(
+            f"Local checkpoint path not found: '{model_or_adapter_path}'. "
+            f"Current working directory is '{cwd}'. "
+            "Use an absolute path or `cd` to the repository root before running."
+        )
+
+    adapter_cfg_path = path_obj / "adapter_config.json"
     if adapter_cfg_path.exists():
         if PeftModel is None:
             raise ImportError("peft is required to load adapter checkpoints.")
@@ -158,7 +178,7 @@ def load_policy_or_adapter(
             load_in_bits=load_in_bits,
             device_map=device_map,
         )
-        model = PeftModel.from_pretrained(base_model, model_or_adapter_path, is_trainable=is_trainable_adapter)
+        model = PeftModel.from_pretrained(base_model, str(path_obj), is_trainable=is_trainable_adapter)
         model.config.use_cache = False
         if enable_gradient_checkpointing and is_trainable_adapter:
             model.gradient_checkpointing_enable()
