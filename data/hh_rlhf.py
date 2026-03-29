@@ -184,14 +184,6 @@ class SFTCollator:
             padding=True,
             return_tensors="pt",
         )
-        prompt_lens = self.tokenizer(
-            prompts,
-            max_length=self.max_length,
-            truncation=True,
-            add_special_tokens=False,
-            padding=False,
-            return_tensors="pt",
-        )["input_ids"].shape[1]
         # Per-example prompt lengths can vary; recompute without batching for exactness.
         per_prompt_lens = torch.tensor(
             [
@@ -231,7 +223,7 @@ class SFTCollator:
             "chosen": responses,
             "full_text": full_texts,
             "prompt_lengths": per_prompt_lens,
-            "max_prompt_length_in_batch": prompt_lens,
+            "max_prompt_length_in_batch": int(per_prompt_lens.max().item()) if per_prompt_lens.numel() else 0,
         }
 
 
